@@ -24,6 +24,24 @@ TRAJOPT_IGNORE_WARNINGS_POP
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <tesseract_core/basic_types.h>
+#include <tesseract_planning/trajopt/trajopt_planner.h>
+
+#include<moveit/move_group_interface/move_group.h>
+#include <trajectory_msgs/JointTrajectory.h>
+#include <moveit/robot_trajectory/robot_trajectory.h>
+
+#include <tf/transform_listener.h>
+#include <tf_conversions/tf_eigen.h>
+#include <actionlib/client/simple_action_client.h>
+#include <control_msgs/FollowJointTrajectoryAction.h>
+
+#include <moveit/trajectory_processing/iterative_time_parameterization.h>
+
+#include <trajopt/file_write_callback.hpp>
+#include <trajopt/plot_callback.hpp>
+#include <trajopt_utils/logging.hpp>
+
 using namespace std;
 
 using namespace trajopt;
@@ -71,6 +89,61 @@ static urdf::ModelInterfaceSharedPtr urdf_model_; //< URDF Model
 static srdf::ModelSharedPtr srdf_model_;          //< SRDF Model 
 static tesseract_ros::KDLEnvPtr env;             //< Trajopt Basic Environment 
 
+// --------------------------------------------------------------------------------------------------------------
+
+trajectory_msgs::JointTrajectory trajArrayToJointTrajectoryMsg(std::vector<std::string> joint_names,
+                                                               tesseract::TrajArray traj_array,
+                                                               bool use_time,
+                                                               ros::Duration time_increment)
+{
+  // Create the joint trajectory
+  trajectory_msgs::JointTrajectory traj_msg;
+  traj_msg.header.stamp = ros::Time::now();
+  traj_msg.header.frame_id = "0";
+  traj_msg.joint_names = joint_names;
+
+  tesseract::TrajArray pos_mat;
+  tesseract::TrajArray time_mat;
+  if (use_time)
+  {
+    // Seperate out the time data in the last column from the joint position data
+    pos_mat = traj_array.leftCols(traj_array.cols());
+    time_mat = traj_array.rightCols(1);
+  }
+  else
+  {
+    pos_mat = traj_array;
+  }
+
+  ros::Duration time_from_start(0);
+  for (int ind = 0; ind < traj_array.rows(); ind++)
+  {
+    // Create trajectory point
+    trajectory_msgs::JointTrajectoryPoint traj_point;
+
+    // Set the position for this time step
+    auto mat = pos_mat.row(ind);
+    std::vector<double> vec(mat.data(), mat.data() + mat.rows() * mat.cols());
+    traj_point.positions = vec;
+
+    // Add the current dt to the time_from_start
+    if (use_time)
+    {
+      time_from_start += ros::Duration(time_mat(ind, time_mat.cols() - 1));
+    }
+    else
+    {
+      time_from_start += time_increment;
+    }
+    traj_point.time_from_start = time_from_start;
+
+    traj_msg.points.push_back(traj_point);
+  }
+  return traj_msg;
+}
+
+// ----------------------------------------------------------------------------------------------------------------
+
 void addCollisionObject(){
   AttachableObjectPtr obj(new AttachableObject());
   std::shared_ptr<shapes::Mesh>
@@ -108,7 +181,7 @@ TrajOptProbPtr cppMethod()
   pci.basic_info.n_steps = steps_;
   pci.basic_info.manip = "manipulator";
   pci.basic_info.start_fixed = false;
-  pci.basic_info.use_time = false;
+  pci.basic_info.use_time = true;
   //  pci.basic_info.dofs_fixed
 
   // Create Kinematic Object
@@ -127,12 +200,12 @@ TrajOptProbPtr cppMethod()
   jv->first_step = 0;
   jv->last_step = pci.basic_info.n_steps - 1;
   jv->name = "joint_vel";
-  jv->term_type = TT_COST;
+  jv->term_type = TT_CNT | TT_USE_TIME;;
   pci.cost_infos.push_back(jv);
 
   std::shared_ptr<CollisionTermInfo> collision = std::shared_ptr<CollisionTermInfo>(new CollisionTermInfo);
   collision->name = "collision";
-  collision->term_type = TT_COST;
+  collision->term_type = TT_CNT | TT_USE_TIME;;
   collision->continuous = false;
   collision->first_step = 0;
   collision->last_step = pci.basic_info.n_steps - 1;
@@ -142,9 +215,9 @@ TrajOptProbPtr cppMethod()
 
   int waypoint = 0;
 
-  double x = 0.65586677727;
-  double y = 0.109246185391;
-  double z = 0.0839935774293;
+  double x = 0.590001653084;
+  double y = 0.12014305211;
+  double z = 0.158311145042;
 
   double ox = -1.0;
   double oy = 0.0;
@@ -304,12 +377,12 @@ int main(int argc, char** argv)
 
   // Set the robot initial state
   std::unordered_map<std::string, double> ipos;
-  ipos["shoulder_pan_joint"] = 0.0;
-  ipos["shoulder_lift_joint"] = -0.8976;
-  ipos["elbow_joint"] = 1.57;
-  ipos["wrist_1_joint"] = -0.6905;
-  ipos["wrist_2_joint"] = 1.57;
-  ipos["wrist_3_joint"] = 0.0;
+  ipos["shoulder_pan_joint"] = 0.772991120815;
+  ipos["shoulder_lift_joint"] = -1.12945110003;
+  ipos["elbow_joint"] = 1.76839208603;
+  ipos["wrist_1_joint"] = -2.22183162371;
+  ipos["wrist_2_joint"] = 4.71922874451;
+  ipos["wrist_3_joint"] = -0.0558503309833;
 
   env->setState(ipos);
 
@@ -352,27 +425,95 @@ int main(int argc, char** argv)
   TrajArray output = getTraj(opt.x(), prob->GetVars()); 
   ROS_INFO_STREAM("\n" << output );
 
-  // wegschrijven in file
-  for(int k=0; k<=steps_-1; k++){
-    trajopt_file << "-:";
-    for(int r=0; r<5; r++){
-      trajopt_file << output(k,r);
-      trajopt_file << ",";
+  // Execute trajectory
+  std::cout << "Execute Trajectory on hardware? y/n \n";
+  char input = 'n';
+  std::cin >> input;
+  if (input == 'y')
+  {
+    std::cout << "Executing... \n";
+
+    // Create action client to send trajectories
+    actionlib::SimpleActionClient<control_msgs::FollowJointTrajectoryAction> execution_client("follow_joint_trajectory", true);
+    execution_client.waitForServer();
+
+    // Convert TrajArray (Eigen Matrix of joint values) to ROS message
+    trajectory_msgs::JointTrajectory traj_msg;
+    ros::Duration t(0.25);
+
+    std::vector<std::string> joint_names;
+    joint_names.push_back("shoulder_pan_joint");
+    joint_names.push_back("shoulder_lift_joint");
+    joint_names.push_back("elbow_joint");
+    joint_names.push_back("wrist_1_joint");
+    joint_names.push_back("wrist_2_joint");
+    joint_names.push_back("wrist_3_joint");
+
+    traj_msg = trajArrayToJointTrajectoryMsg(joint_names, output, false, t);
+
+    // traj_msg bevat nu enkel joint posities, UR5 driver verwacht ook joint velocities dus die gaan we hier toevoegen:
+    // --------------------------------------------------------------------------------------------
+    //moveit_msgs::RobotTrajectory trajectory_msg;
+  
+
+    // First to create a RobotTrajectory object
+    moveit::planning_interface::MoveGroup group("manipulator");
+
+    group.setPlanningTime(20.0);
+    robot_trajectory::RobotTrajectory rt(group.getCurrentState()->getRobotModel(), "manipulator");
+    std::string eef_link = group.getEndEffectorLink();
+    std::string eef = group.getEndEffector();
+    std::string base_link = group.getPoseReferenceFrame();
+    group.setStartStateToCurrentState();
+    group.setPoseReferenceFrame(base_link);
+    group.setEndEffectorLink(eef_link);
+
+
+    // Second get a RobotTrajectory from trajectory
+    rt.setRobotTrajectoryMsg(*group.getCurrentState(), traj_msg);
+  
+    // Thrid create a IterativeParabolicTimeParameterization object
+    trajectory_processing::IterativeParabolicTimeParameterization iptp;
+
+    // Fourth compute computeTimeStamps
+    success = iptp.computeTimeStamps(rt);
+    ROS_INFO("Computed time stamp %s",success?"SUCCEDED":"FAILED");
+
+    // Get RobotTrajectory_msg from RobotTrajectory
+    //moveit_msgs::RobotTrajectory trajectory_msg;
+    rt.getRobotTrajectoryMsg(traj_msg);
+
+    /*
+    // Finally plan and execute the trajectory
+    plan.trajectory_ = trajectory_msg;
+    ROS_INFO("Visualizing plan 4 (cartesian path) (%.2f%% acheived)",fraction * 100.0);   
+    sleep(5.0);
+    group.execute(plan);
+    */
+
+    // --------------------------------------------------------------------------------------------
+    // Create action message
+    control_msgs::FollowJointTrajectoryGoal trajectory_action;
+    trajectory_action.trajectory = traj_msg;
+    //        trajectory_action.trajectory.header.frame_id="world";
+    //        trajectory_action.trajectory.header.stamp = ros::Time(0);
+    //        trajectory_action.goal_time_tolerance = ros::Duration(1.0);
+    // May need to update other tolerances as well.
+
+    // Send to hardware
+    execution_client.sendGoal(trajectory_action);
+    execution_client.waitForResult(ros::Duration(20.0));
+
+    if (execution_client.getState() == actionlib::SimpleClientGoalState::SUCCEEDED)
+    {
+      std::cout << "Pick action succeeded! \n";
     }
-    trajopt_file << output(k,5);
-    trajopt_file << "\n";
+    else
+    {
+      std::cout << "Pick action failed \n";
+    }
   }
 
-  trajopt_file << "end: \n";
-  trajopt_file.close();
-
-  ROS_INFO_STREAM("Wegschrijven data is gelukt.");
-  // -------------------------------------------------------------------
-  
-  // plot trajectory
-  plotter->plotTrajectory(prob->GetKin()->getJointNames(), getTraj(opt.x(), prob->GetVars()));
-  ROS_INFO_STREAM(" -- TRAJECTORY IS AAN HET SIMULEREN --");
-    
   ROS_INFO("Done");
   ros::spin();
   return 0;
